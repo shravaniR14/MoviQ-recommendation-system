@@ -1,9 +1,5 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-sentence-transformers
-qdrant-client
 fastapi
-uvicorn[standard]
+uvicorn
 pandas
 numpy
 pydantic
@@ -11,3 +7,6 @@ python-dotenv
 requests
 scikit-learn
 google-genai
+qdrant-client
+sentence-transformers
+torch
