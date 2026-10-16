@@ -1,8 +1,8 @@
 data/raw/
 data/qdrant_local/
-tests/
 .git/
-.venv/
 __pycache__/
-.pytest_cache/
 *.pyc
+.venv/
+venv/
+node_modules/

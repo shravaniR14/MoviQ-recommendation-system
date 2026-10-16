@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/main.py": {
+      "excludeFiles": "data/raw/**,data/qdrant_local/**,**/__pycache__/**,**/*.pyc"
+    }
+  }
+}

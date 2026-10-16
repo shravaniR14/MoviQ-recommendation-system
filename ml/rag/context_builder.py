@@ -1,19 +1,18 @@
-from ml.vectorstore.search import MovieSearcher
-
 
 class MovieContextBuilder:
-
     def __init__(self, hybrid_recommender=None):
         self.hybrid_recommender = hybrid_recommender
-        self._searcher = None if hybrid_recommender is not None else MovieSearcher()
+        self._searcher = None
 
     @property
     def searcher(self):
         if self._searcher is None:
+            from ml.vectorstore.search import MovieSearcher
             self._searcher = MovieSearcher()
         return self._searcher
 
     def retrieve(self, query, top_k=5, language=None, user_id=None):
+        # Prefer the hybrid ML recommendation system when available.
         if self.hybrid_recommender is not None:
             df = self.hybrid_recommender.search(
                 query=query,
@@ -21,16 +20,27 @@ class MovieContextBuilder:
                 k=top_k,
                 language=language,
             )
+
             if df.empty:
                 return []
 
             context = []
+
             for _, row in df.iterrows():
                 tmdb_id = row.get("tmdb_id")
                 movie_dict = {}
-                if tmdb_id is not None and int(tmdb_id) in self.hybrid_recommender.tmdb_to_idx:
-                    idx = self.hybrid_recommender.tmdb_to_idx[int(tmdb_id)]
-                    movie_dict = self.hybrid_recommender.content_rec.get_movie_by_idx(idx)
+
+                if tmdb_id is not None:
+                    try:
+                        tmdb_id = int(tmdb_id)
+                        if tmdb_id in self.hybrid_recommender.tmdb_to_idx:
+                            idx = self.hybrid_recommender.tmdb_to_idx[tmdb_id]
+                            movie_dict = (
+                                self.hybrid_recommender.content_rec
+                                .get_movie_by_idx(idx)
+                            )
+                    except (ValueError, TypeError):
+                        pass
 
                 context.append({
                     "title": row.get("title") or movie_dict.get("title"),
@@ -43,8 +53,10 @@ class MovieContextBuilder:
                     "overview": movie_dict.get("overview", ""),
                     "hybrid_score": row.get("hybrid_score"),
                 })
+
             return context
 
+        # Fall back to Qdrant semantic search when no hybrid recommender is supplied.
         results = self.searcher.search(
             query=query,
             top_k=top_k,
@@ -52,8 +64,10 @@ class MovieContextBuilder:
         )
 
         context = []
+
         for result in results:
-            movie = result.payload
+            movie = result.payload or {}
+
             context.append({
                 "title": movie.get("title"),
                 "year": movie.get("release_year"),
@@ -84,10 +98,10 @@ def main():
     print("=" * 70)
 
     for i, movie in enumerate(results, 1):
-        print(f"\n{i}. {movie['title']} ({movie['year']})")
-        print(f"   Genres: {movie['genres']}")
-        print(f"   Rating: {movie['rating']}")
-        print(f"   Overview: {movie['overview']}")
+        print(f"\n{i}. {movie.get('title')} ({movie.get('year')})")
+        print(f"   Genres: {movie.get('genres')}")
+        print(f"   Rating: {movie.get('rating')}")
+        print(f"   Overview: {movie.get('overview')}")
 
 
 if __name__ == "__main__":
