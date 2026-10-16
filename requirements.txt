@@ -1,3 +1,4 @@
+
 fastapi
 uvicorn
 pandas
@@ -9,5 +10,4 @@ scikit-learn
 google-genai
 qdrant-client
 sentence-transformers
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.6.0+cpu
+torch
