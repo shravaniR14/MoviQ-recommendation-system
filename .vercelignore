@@ -1,6 +1,5 @@
 data/raw/
 data/qdrant_local/
-frontend/
 tests/
 .git/
 .venv/
