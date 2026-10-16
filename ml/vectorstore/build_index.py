@@ -1,65 +1,57 @@
+
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 from qdrant_client import QdrantClient, models
 
 
 # =========================================================
-# PATHS
+# CONFIGURATION
 # =========================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 EMBEDDINGS_PATH = (
-    PROJECT_ROOT
-    / "data"
-    / "processed"
-    / "embeddings"
+    PROJECT_ROOT / "data" / "processed" / "embeddings"
     / "emb_e5_multilingual.npy"
 )
 
 EMBEDDING_IDS_PATH = (
-    PROJECT_ROOT
-    / "data"
-    / "processed"
-    / "embeddings"
+    PROJECT_ROOT / "data" / "processed" / "embeddings"
     / "emb_ids.parquet"
 )
 
 MOVIES_TEXT_PATH = (
-    PROJECT_ROOT
-    / "data"
-    / "processed"
-    / "movies_text.parquet"
+    PROJECT_ROOT / "data" / "processed" / "movies_text.parquet"
 )
 
-QDRANT_PATH = PROJECT_ROOT / "data" / "qdrant_local"
-
 COLLECTION_NAME = "movies"
-
 VECTOR_SIZE = 768
-
 BATCH_SIZE = 500
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 
 # =========================================================
-# HELPER
+# HELPERS
 # =========================================================
 
 def clean_payload_value(value):
-    """Convert pandas/NumPy values into Qdrant-safe values."""
+    """Convert pandas and NumPy values to Qdrant-safe values."""
 
-    # Lists, tuples, NumPy arrays
     if isinstance(value, (list, tuple, np.ndarray)):
-        return list(value)
+        return [clean_payload_value(item) for item in value]
 
-    # NumPy scalar
     if isinstance(value, np.generic):
         value = value.item()
 
-    # None / NaN / NaT
-    if value is None:
+    if value is None or value is pd.NA:
+        return None
+
+    if isinstance(value, (float, np.floating)) and not np.isfinite(value):
         return None
 
     try:
@@ -76,16 +68,22 @@ def clean_payload_value(value):
 # =========================================================
 
 def main():
-
     print("=" * 60)
-    print("MOVIQ - Building Local Qdrant Index")
+    print("MOVIQ - Qdrant Cloud Index Builder")
     print("=" * 60)
 
-    # -----------------------------------------------------
-    # 1. Check files
-    # -----------------------------------------------------
+    # 1. Validate environment
+    qdrant_url = os.getenv("QDRANT_URL")
+    qdrant_api_key = os.getenv("QDRANT_API_KEY")
 
-    print("\n[1/5] Checking files...")
+    if not qdrant_url or not qdrant_api_key:
+        raise ValueError(
+            "QDRANT_URL or QDRANT_API_KEY is missing. "
+            "Check your project .env file."
+        )
+
+    # 2. Validate local data files
+    print("\n[1/6] Checking data files...")
 
     required_files = [
         EMBEDDINGS_PATH,
@@ -94,183 +92,76 @@ def main():
     ]
 
     for path in required_files:
+        if not path.is_file():
+            raise FileNotFoundError(f"Required file not found: {path}")
+        print(f"Found: {path.name}")
 
-        if not path.exists():
-            raise FileNotFoundError(
-                f"Required file not found:\n{path}"
-            )
+    # 3. Load existing embeddings and metadata
+    print("\n[2/6] Loading existing embeddings...")
 
-        print(f"✓ {path.name}")
+    embeddings = np.load(EMBEDDINGS_PATH, mmap_mode="r")
 
-    # -----------------------------------------------------
-    # 2. Load embeddings
-    # -----------------------------------------------------
-
-    print("\n[2/5] Loading embeddings...")
-
-    embeddings = np.load(EMBEDDINGS_PATH)
-
-    print(
-        f"Embedding shape: {embeddings.shape}"
-    )
-
-    if embeddings.ndim != 2:
+    if embeddings.ndim != 2 or embeddings.shape[1] != VECTOR_SIZE:
         raise ValueError(
-            f"Expected 2D embeddings, got {embeddings.ndim}D."
+            f"Expected embeddings shaped (N, {VECTOR_SIZE}); "
+            f"received {embeddings.shape}."
         )
 
-    if embeddings.shape[1] != VECTOR_SIZE:
-        raise ValueError(
-            f"Expected {VECTOR_SIZE}-dimensional vectors, "
-            f"but found {embeddings.shape[1]}."
-        )
+    if not np.isfinite(embeddings).all():
+        raise ValueError("Embeddings contain NaN or infinite values.")
 
-    # -----------------------------------------------------
-    # 3. Load embedding IDs
-    # -----------------------------------------------------
+    emb_ids = pd.read_parquet(EMBEDDING_IDS_PATH)
+    movies = pd.read_parquet(MOVIES_TEXT_PATH)
 
-    print("\nLoading embedding IDs...")
+    for name, frame in [
+        ("Embedding IDs", emb_ids),
+        ("Movie metadata", movies),
+    ]:
+        if "tmdb_id" not in frame.columns:
+            raise ValueError(f"{name} must contain a 'tmdb_id' column.")
 
-    emb_ids = pd.read_parquet(
-        EMBEDDING_IDS_PATH
-    )
+        if frame["tmdb_id"].isna().any():
+            raise ValueError(f"{name} contains missing tmdb_id values.")
 
-    print(
-        f"Embedding ID rows: {len(emb_ids)}"
-    )
-
-    print(
-        f"Embedding ID columns: {list(emb_ids.columns)}"
-    )
-
-    if "tmdb_id" not in emb_ids.columns:
-        raise ValueError(
-            "emb_ids.parquet must contain 'tmdb_id'."
-        )
-
-    # -----------------------------------------------------
-    # 4. Load movie metadata
-    # -----------------------------------------------------
-
-    print("\nLoading movie metadata...")
-
-    movies = pd.read_parquet(
-        MOVIES_TEXT_PATH
-    )
-
-    print(
-        f"Movie rows: {len(movies)}"
-    )
-
-    if "tmdb_id" not in movies.columns:
-        raise ValueError(
-            "movies_text.parquet must contain 'tmdb_id'."
-        )
-
-    # -----------------------------------------------------
-    # 5. Validate counts
-    # -----------------------------------------------------
+        if frame["tmdb_id"].duplicated().any():
+            raise ValueError(f"{name} contains duplicate tmdb_id values.")
 
     if len(embeddings) != len(emb_ids):
         raise ValueError(
-            f"Embedding count ({len(embeddings)}) "
-            f"does not match ID count ({len(emb_ids)})."
+            f"Embedding count ({len(embeddings)}) does not match "
+            f"ID count ({len(emb_ids)})."
         )
 
-    print(
-        "✓ Embedding and ID counts match."
-    )
+    print(f"Embedding shape: {embeddings.shape}")
+    print(f"Embedding ID rows: {len(emb_ids):,}")
+    print(f"Movie metadata rows: {len(movies):,}")
 
-    # -----------------------------------------------------
-    # 6. Merge metadata
-    # -----------------------------------------------------
-
-    print("\nMerging movie metadata...")
+    # 4. Merge metadata and validate payload
+    print("\n[3/6] Validating movie metadata...")
 
     data = emb_ids.merge(
         movies,
         on="tmdb_id",
         how="left",
         validate="one_to_one",
+        indicator=True,
     )
+
+    unmatched = int((data["_merge"] != "both").sum())
+    if unmatched:
+        raise ValueError(
+            f"{unmatched} embedding IDs have no matching movie metadata."
+        )
+
+    data = data.drop(columns=["_merge"])
 
     if len(data) != len(embeddings):
-        raise ValueError(
-            "Merge changed the number of rows."
-        )
+        raise ValueError("Metadata merge changed the embedding count.")
 
-    if data["title"].isna().any():
-
-        missing_count = int(
-            data["title"].isna().sum()
-        )
-
-        raise ValueError(
-            f"{missing_count} movies could not be "
-            f"matched with metadata."
-        )
-
-    print(
-        f"✓ Final rows for Qdrant: {len(data)}"
-    )
-
-    # -----------------------------------------------------
-    # 7. Create Qdrant storage
-    # -----------------------------------------------------
-
-    print("\nCreating Qdrant local storage...")
-
-    QDRANT_PATH.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    client = QdrantClient(
-        path=str(QDRANT_PATH)
-    )
-
-    # -----------------------------------------------------
-    # 8. Create collection
-    # -----------------------------------------------------
-
-    if client.collection_exists(
-        COLLECTION_NAME
-    ):
-
-        print(
-            f"Collection '{COLLECTION_NAME}' already exists."
-        )
-
-        print(
-            "Deleting old collection..."
-        )
-
-        client.delete_collection(
-            collection_name=COLLECTION_NAME
-        )
-
-    print(
-        f"Creating collection '{COLLECTION_NAME}'..."
-    )
-
-    client.create_collection(
-
-        collection_name=COLLECTION_NAME,
-
-        vectors_config=models.VectorParams(
-
-            size=VECTOR_SIZE,
-
-            distance=models.Distance.COSINE,
-        ),
-    )
-
-    # -----------------------------------------------------
-    # 9. Payload columns
-    # -----------------------------------------------------
+    if "title" not in data.columns or data["title"].isna().any():
+        raise ValueError("Movie metadata contains missing titles.")
 
     payload_columns = [
-
         "tmdb_id",
         "title",
         "language",
@@ -288,126 +179,122 @@ def main():
     ]
 
     missing_columns = [
-        column
-        for column in payload_columns
-        if column not in data.columns
+        column for column in payload_columns if column not in data.columns
     ]
 
     if missing_columns:
         raise ValueError(
-            "Missing payload columns:\n"
+            "Missing required payload columns: "
             + ", ".join(missing_columns)
         )
 
-    # -----------------------------------------------------
-    # 10. Index movies
-    # -----------------------------------------------------
+    # Qdrant point IDs must be valid integers and unique.
+    numeric_ids = pd.to_numeric(data["tmdb_id"], errors="raise")
 
-    print("\nIndexing movies into Qdrant...")
+    if not np.equal(numeric_ids, np.floor(numeric_ids)).all():
+        raise ValueError("tmdb_id values must be integers.")
 
-    total = len(data)
+    point_ids = numeric_ids.astype("int64")
 
-    for start in range(
-        0,
-        total,
-        BATCH_SIZE
-    ):
+    if point_ids.duplicated().any():
+        raise ValueError("Duplicate Qdrant point IDs detected.")
 
-        end = min(
-            start + BATCH_SIZE,
-            total
-        )
+    print(f"Validated movies: {len(data):,}")
 
-        batch = data.iloc[start:end]
+    # 5. Connect to Qdrant Cloud
+    print("\n[4/6] Connecting to Qdrant Cloud...")
 
-        points = []
+    client = QdrantClient(
+        url=qdrant_url,
+        api_key=qdrant_api_key,
+        timeout=60,
+    )
 
-        for row_index, (_, row) in enumerate(
-            batch.iterrows()
-        ):
+    try:
+        collections = client.get_collections().collections
+        existing_names = {collection.name for collection in collections}
 
-            vector_index = (
-                start + row_index
+        # Safety: never delete or overwrite an existing collection.
+        if COLLECTION_NAME in existing_names:
+            raise RuntimeError(
+                f"Collection '{COLLECTION_NAME}' already exists in Qdrant "
+                "Cloud. No data was deleted or uploaded. Verify the "
+                "collection before deciding how to proceed."
             )
 
-            payload = {}
-
-            for column in payload_columns:
-
-                value = clean_payload_value(
-                    row[column]
-                )
-
-                payload[column] = value
-
-            point_id = int(
-                row["tmdb_id"]
-            )
-
-            points.append(
-
-                models.PointStruct(
-
-                    id=point_id,
-
-                    vector=embeddings[
-                        vector_index
-                    ].tolist(),
-
-                    payload=payload,
-                )
-            )
-
-        client.upsert(
-
+        client.create_collection(
             collection_name=COLLECTION_NAME,
-
-            points=points,
+            vectors_config=models.VectorParams(
+                size=VECTOR_SIZE,
+                distance=models.Distance.COSINE,
+            ),
         )
 
-        print(
-            f"Indexed {end:,}/{total:,} movies"
-        )
+        print(f"Created collection: {COLLECTION_NAME}")
 
-    # -----------------------------------------------------
-    # 11. Verify
-    # -----------------------------------------------------
+        # 6. Upload vectors in batches
+        print("\n[5/6] Uploading existing movie vectors...")
 
-    collection_info = client.get_collection(
-        COLLECTION_NAME
-    )
+        total = len(data)
 
-    print("\n")
-    print("=" * 60)
-    print("QDRANT INDEX CREATED SUCCESSFULLY")
-    print("=" * 60)
+        for start in range(0, total, BATCH_SIZE):
+            end = min(start + BATCH_SIZE, total)
+            batch = data.iloc[start:end]
 
-    print(
-        f"Collection : {COLLECTION_NAME}"
-    )
+            points = []
 
-    print(
-        f"Points     : {collection_info.points_count:,}"
-    )
+            for row_index, (_, row) in enumerate(batch.iterrows()):
+                vector_index = start + row_index
 
-    print(
-        f"Vector size: {VECTOR_SIZE}"
-    )
+                payload = {
+                    column: clean_payload_value(row[column])
+                    for column in payload_columns
+                }
 
-    print(
-        "Distance   : COSINE"
-    )
+                vector = np.asarray(
+                    embeddings[vector_index], dtype=np.float32
+                )
 
-    print(
-        f"Storage    : {QDRANT_PATH}"
-    )
+                points.append(
+                    models.PointStruct(
+                        id=int(point_ids.iloc[vector_index]),
+                        vector=vector.tolist(),
+                        payload=payload,
+                    )
+                )
 
-    print("=" * 60)
+            client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=points,
+                wait=True,
+            )
 
+            print(f"Uploaded {end:,}/{total:,} movies")
 
-# =========================================================
-# ENTRY POINT
-# =========================================================
+        # Verify upload
+        print("\n[6/6] Verifying cloud collection...")
+
+        info = client.get_collection(COLLECTION_NAME)
+        actual_count = info.points_count
+
+        print("=" * 60)
+
+        if actual_count != total:
+            raise RuntimeError(
+                f"Upload verification failed: expected {total:,} points, "
+                f"found {actual_count:,}."
+            )
+
+        print("QDRANT CLOUD INDEX CREATED SUCCESSFULLY")
+        print(f"Collection : {COLLECTION_NAME}")
+        print(f"Points     : {actual_count:,}")
+        print(f"Vector size: {VECTOR_SIZE}")
+        print("Distance   : COSINE")
+        print("=" * 60)
+
+    finally:
+        client.close()
+
 
 if __name__ == "__main__":
     main()

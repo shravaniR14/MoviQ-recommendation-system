@@ -1,32 +1,96 @@
+
+import logging
+import os
 from pathlib import Path
 
-import numpy as np
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient, models
 
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(PROJECT_ROOT / ".env")
 
 QDRANT_PATH = PROJECT_ROOT / "data" / "qdrant_local"
-
 COLLECTION_NAME = "movies"
-
 MODEL_NAME = "intfloat/multilingual-e5-base"
-
 VECTOR_SIZE = 768
 
 
 class MovieSearcher:
+    _model = None
 
     def __init__(self):
+        qdrant_url = os.getenv("QDRANT_URL")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
 
-        self.client = QdrantClient(
-            path=str(QDRANT_PATH)
-        )
+        # Prefer Qdrant Cloud when configured.
+        if qdrant_url:
+            if not qdrant_api_key:
+                raise RuntimeError(
+                    "QDRANT_API_KEY is required when QDRANT_URL is set."
+                )
 
-        self.model = SentenceTransformer(
-            MODEL_NAME
-        )
+            self.client = QdrantClient(
+                url=qdrant_url,
+                api_key=qdrant_api_key,
+                timeout=30,
+            )
+            logger.info("Connected to Qdrant Cloud.")
+
+        else:
+            # Do not silently use local storage in Render.
+            if os.getenv("RENDER"):
+                raise RuntimeError(
+                    "QDRANT_URL and QDRANT_API_KEY must be configured "
+                    "in the Render environment."
+                )
+
+            if not QDRANT_PATH.exists():
+                raise RuntimeError(
+                    f"Local Qdrant storage not found: {QDRANT_PATH}"
+                )
+
+            self.client = QdrantClient(path=str(QDRANT_PATH))
+            logger.info("Connected to local Qdrant.")
+
+        # Verify the collection before loading the model.
+        try:
+            collections = self.client.get_collections().collections
+            names = {collection.name for collection in collections}
+
+            if COLLECTION_NAME not in names:
+                raise RuntimeError(
+                    f"Qdrant collection '{COLLECTION_NAME}' was not found."
+                )
+
+            info = self.client.get_collection(COLLECTION_NAME)
+
+            if info.config.params.vectors.size != VECTOR_SIZE:
+                raise RuntimeError(
+                    f"Expected {VECTOR_SIZE}-dimensional vectors, but "
+                    f"collection has {info.config.params.vectors.size}."
+                )
+
+            logger.info(
+                "Verified collection '%s' with %s points.",
+                COLLECTION_NAME,
+                info.points_count,
+            )
+
+        except Exception:
+            self.client.close()
+            raise
+
+        # Load the embedding model only once per process.
+        if MovieSearcher._model is None:
+            logger.info("Loading embedding model: %s", MODEL_NAME)
+            MovieSearcher._model = SentenceTransformer(MODEL_NAME)
+            logger.info("Embedding model loaded.")
+
+        self.model = MovieSearcher._model
 
     def search(
         self,
@@ -40,6 +104,7 @@ class MovieSearcher:
         max_runtime=None,
         genre=None,
     ):
+        """Search movies using multilingual semantic embeddings."""
 
         query_vector = self.model.encode(
             f"query: {query}",
@@ -60,10 +125,11 @@ class MovieSearcher:
             collection_name=COLLECTION_NAME,
             query=query_vector.tolist(),
             query_filter=query_filter,
-            limit=top_k,
+            limit=max(1, min(int(top_k), 100)),
             with_payload=True,
         )
 
+        # Preserve Claude's original return format: Qdrant ScoredPoint objects.
         return results.points
 
     @staticmethod
@@ -76,16 +142,13 @@ class MovieSearcher:
         max_runtime=None,
         genre=None,
     ):
-
         conditions = []
 
         if language:
             conditions.append(
                 models.FieldCondition(
                     key="language",
-                    match=models.MatchValue(
-                        value=language
-                    ),
+                    match=models.MatchValue(value=language),
                 )
             )
 
@@ -93,9 +156,7 @@ class MovieSearcher:
             conditions.append(
                 models.FieldCondition(
                     key="release_year",
-                    range=models.Range(
-                        gte=min_year
-                    ),
+                    range=models.Range(gte=min_year),
                 )
             )
 
@@ -103,9 +164,7 @@ class MovieSearcher:
             conditions.append(
                 models.FieldCondition(
                     key="release_year",
-                    range=models.Range(
-                        lte=max_year
-                    ),
+                    range=models.Range(lte=max_year),
                 )
             )
 
@@ -113,9 +172,7 @@ class MovieSearcher:
             conditions.append(
                 models.FieldCondition(
                     key="vote_average",
-                    range=models.Range(
-                        gte=min_rating
-                    ),
+                    range=models.Range(gte=min_rating),
                 )
             )
 
@@ -123,9 +180,7 @@ class MovieSearcher:
             conditions.append(
                 models.FieldCondition(
                     key="vote_count",
-                    range=models.Range(
-                        gte=min_votes
-                    ),
+                    range=models.Range(gte=min_votes),
                 )
             )
 
@@ -133,9 +188,7 @@ class MovieSearcher:
             conditions.append(
                 models.FieldCondition(
                     key="runtime",
-                    range=models.Range(
-                        lte=max_runtime
-                    ),
+                    range=models.Range(lte=max_runtime),
                 )
             )
 
@@ -143,25 +196,17 @@ class MovieSearcher:
             conditions.append(
                 models.FieldCondition(
                     key="genres",
-                    match=models.MatchValue(
-                        value=genre
-                    ),
+                    match=models.MatchValue(value=genre),
                 )
             )
 
         if not conditions:
             return None
 
-        return models.Filter(
-            must=conditions
-        )
+        return models.Filter(must=conditions)
 
 
-def print_results(
-    query,
-    results,
-):
-
+def print_results(query, results):
     print("\n" + "=" * 60)
     print(f"QUERY: {query}")
     print("=" * 60)
@@ -170,147 +215,40 @@ def print_results(
         print("No results found.")
         return
 
-    for i, result in enumerate(
-        results,
-        start=1,
-    ):
+    for i, result in enumerate(results, start=1):
+        movie = result.payload or {}
 
-        movie = result.payload
-
-        print(
-            f"\n{i}. {movie.get('title')}"
-        )
-
-        print(
-            f"   TMDB ID: {movie.get('tmdb_id')}"
-        )
-
-        print(
-            f"   Language: {movie.get('language')}"
-        )
-
-        print(
-            f"   Year: {movie.get('release_year')}"
-        )
-
-        print(
-            f"   Rating: {movie.get('vote_average')}"
-        )
-
-        print(
-            f"   Genres: {movie.get('genres')}"
-        )
-
-        print(
-            f"   Score: {result.score:.4f}"
-        )
+        print(f"\n{i}. {movie.get('title')}")
+        print(f"   TMDB ID: {movie.get('tmdb_id')}")
+        print(f"   Language: {movie.get('language')}")
+        print(f"   Year: {movie.get('release_year')}")
+        print(f"   Rating: {movie.get('vote_average')}")
+        print(f"   Genres: {movie.get('genres')}")
+        print(f"   Score: {result.score:.4f}")
 
 
 def main():
-
     searcher = MovieSearcher()
 
-    # -----------------------------------------------------
-    # 1. Basic English search
-    # -----------------------------------------------------
+    try:
+        test_cases = [
+            ("Interstellar", {}),
+            ("3 Idiots", {"language": "hi"}),
+            ("Sairat", {"language": "mr"}),
+            ("दोस्ती वाली कॉमेडी फिल्म", {"language": "hi"}),
+            ("romantic drama", {"language": "mr"}),
+            (
+                "science fiction",
+                {"language": "mr", "min_year": 2100},
+            ),
+        ]
 
-    query = "Interstellar"
+        for query, filters in test_cases:
+            results = searcher.search(query, top_k=5, **filters)
+            print_results(query, results)
 
-    results = searcher.search(
-        query,
-        top_k=5,
-    )
-
-    print_results(
-        query,
-        results,
-    )
-
-    # -----------------------------------------------------
-    # 2. Hindi movie
-    # -----------------------------------------------------
-
-    query = "3 Idiots"
-
-    results = searcher.search(
-        query,
-        top_k=5,
-        language="hi",
-    )
-
-    print_results(
-        query,
-        results,
-    )
-
-    # -----------------------------------------------------
-    # 3. Marathi movie
-    # -----------------------------------------------------
-
-    query = "Sairat"
-
-    results = searcher.search(
-        query,
-        top_k=5,
-        language="mr",
-    )
-
-    print_results(
-        query,
-        results,
-    )
-
-    # -----------------------------------------------------
-    # 4. Hindi natural-language query
-    # -----------------------------------------------------
-
-    query = "दोस्ती वाली कॉमेडी फिल्म"
-
-    results = searcher.search(
-        query,
-        top_k=5,
-        language="hi",
-    )
-
-    print_results(
-        query,
-        results,
-    )
-
-    # -----------------------------------------------------
-    # 5. Marathi filter
-    # -----------------------------------------------------
-
-    query = "romantic drama"
-
-    results = searcher.search(
-        query,
-        top_k=5,
-        language="mr",
-    )
-
-    print_results(
-        query,
-        results,
-    )
-
-    # -----------------------------------------------------
-    # 6. Impossible filter
-    # -----------------------------------------------------
-
-    query = "science fiction"
-
-    results = searcher.search(
-        query,
-        top_k=5,
-        language="mr",
-        min_year=2100,
-    )
-
-    print_results(
-        query,
-        results,
-    )
+    finally:
+        searcher.client.close()
 
 
 if __name__ == "__main__":

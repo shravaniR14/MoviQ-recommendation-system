@@ -1,13 +1,13 @@
-pandas>=2.0.0
-numpy>=1.26.0
-pydantic>=2.0.0
-pyarrow>=12.0.0
-pytest>=7.0.0
-python-dotenv>=1.0.0
-requests>=2.31.0
-fastapi
-uvicorn
-google-genai
-scikit-learn
-qdrant-client
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
 sentence-transformers
+qdrant-client
+fastapi
+uvicorn[standard]
+pandas
+numpy
+pydantic
+python-dotenv
+requests
+scikit-learn
+google-genai
