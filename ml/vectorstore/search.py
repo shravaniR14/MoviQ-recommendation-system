@@ -1,4 +1,3 @@
-
 import logging
 import os
 from pathlib import Path
@@ -129,8 +128,15 @@ class MovieSearcher:
             with_payload=True,
         )
 
-        # Preserve Claude's original return format: Qdrant ScoredPoint objects.
-        return results.points
+        # Convert Qdrant ScoredPoint objects to dictionaries
+        # expected by the hybrid recommender.
+        return [
+            {
+                **(point.payload or {}),
+                "score": float(point.score or 0.0),
+            }
+            for point in results.points
+        ]
 
     @staticmethod
     def _build_filter(
@@ -216,15 +222,15 @@ def print_results(query, results):
         return
 
     for i, result in enumerate(results, start=1):
-        movie = result.payload or {}
-
-        print(f"\n{i}. {movie.get('title')}")
-        print(f"   TMDB ID: {movie.get('tmdb_id')}")
-        print(f"   Language: {movie.get('language')}")
-        print(f"   Year: {movie.get('release_year')}")
-        print(f"   Rating: {movie.get('vote_average')}")
-        print(f"   Genres: {movie.get('genres')}")
-        print(f"   Score: {result.score:.4f}")
+        print(f"\n{i}. {result.get('title')}")
+        print(f"   TMDB ID: {result.get('tmdb_id')}")
+        print(f"   Language: {result.get('language')}")
+        print(f"   Year: {result.get('release_year')}")
+        print(f"   Rating: {result.get('vote_average')}")
+        print(f"   Genres: {result.get('genres')}")
+        print(
+            f"   Score: {float(result.get('score', 0.0) or 0.0):.4f}"
+        )
 
 
 def main():
